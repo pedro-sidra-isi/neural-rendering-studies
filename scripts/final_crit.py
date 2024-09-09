@@ -1,115 +1,237 @@
-# %%
+#tutsteste
+# Carregar funções
+
+import plotly.express as px
+import pandas as pd
+import open3d as o3d
 import numpy as np
 from scipy.spatial import KDTree
-import open3d as o3d
+
+# Matthews Correlation Coefficient -  qualidade de uma classificação binária
+def calcular_mcc(tp, tn, fp, fn):
+    numerador = (tp * tn) - (fp * fn)
+    denominador = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+
+    if denominador == 0:
+        return 0 
+    else:
+        return numerador / denominador
 
 
-def marcar_ruido_e_proximidade(Pa, Pr, max_dist=0.1):
-
-    # nparay
+# Função para segmentar Pa por proximidade das partes de Pr
+def segmentar_pa_por_distancia(Pa, Pr_segmentadas):
     Pa_np = np.asarray(Pa.points)
-    Pr_np = np.asarray(Pr.points)
 
-    arv_R = KDTree(Pr_np)
-    arv_A = KDTree(Pa_np)
+    labels = np.zeros(Pa_np.shape[0], dtype=int)
+    min_dists = np.full(Pa_np.shape[0], np.inf)
 
-    # distâncias pa
-    dists, _ = arv_R.query(Pa_np)
+    # Iterar sobre cada parte segmentada de Pr
+    for i, Pr_segmentada in enumerate(Pr_segmentadas):
+        Pr_np = np.asarray(Pr_segmentada.points)
+        arv_R = KDTree(Pr_np)
+        dists_RA, _ = arv_R.query(Pa_np)
 
-    # ruído (distancias >= max dist)
-    idx_ruido = np.where(dists >= max_dist)[0]
+        # Atualizar os rótulos e as distâncias mínimas
+        mask = dists_RA < min_dists
+        labels[mask] = i + 1
+        min_dists[mask] = dists_RA[mask]
 
-    # pontos validos
-    idx_validos = np.where(dists < max_dist)[0]
-    dists_validas = dists[idx_validos]
+    df_pa = pd.DataFrame(Pa_np, columns=["x", "y", "z"])
+    df_pa["label"] = labels
+    df_pa["min_dist"] = min_dists
 
-    idx_oclusos = []
+    return df_pa
 
-    # pontos oclusos na nuvem de referência
-    for j, Pr_j in enumerate(Pr_np):
-        _, idx_vizinho_A = arv_A.query(Pr_j)
-        Pa_k = Pa_np[idx_vizinho_A]
-        dist = np.linalg.norm(Pa_k - Pr_j)
-        if dist > max_dist:
-            idx_oclusos.append(j)
 
-    # porcentagem de pontos bem representados
-    total_ref = len(Pr_np)
-    total_oclusos = len(idx_oclusos)
+# Função para avaliar a correspondência de Pa com as partes segmentadas de Pr usando os labels
+def avaliar_correspondencia_segmentada(df_pa, Pr_segmentadas, max_dist):
+    resultados = []
 
-    if total_ref > 0:
-        pct_representada = 100 * (1 - total_oclusos / total_ref)
-    else:
-        pct_representada = 0  # caso nao tenha pontos
+    for i, Pr_segmentada in enumerate(Pr_segmentadas):
+        Pr_np = np.asarray(Pr_segmentada.points)
 
-    if len(dists) > 0:
-        max_distancia = np.max(dists)
-        min_distancia = np.min(dists)
-        avg_distancia = np.mean(dists)
-        sigma_distancia = np.std(dists)
-    else:
-        max_distancia = min_distancia = avg_distancia = sigma_distancia = 0
+        # Selecionar pontos de Pa que pertencem ao segmento atual
+        Pa_filtrada = df_pa[df_pa["label"] == (i + 1)]
+        Pa_filtrada_np = Pa_filtrada[["x", "y", "z"]].to_numpy()
 
-    return (
-        idx_ruido,
-        idx_validos,
-        dists_validas,
-        idx_oclusos,
-        pct_representada,
-        max_distancia,
-        min_distancia,
-        avg_distancia,
-        sigma_distancia,
-        total_ref,
+        # Árvore pra Pr 
+        arv_R = KDTree(Pr_np)
+        dists_RA, _ = arv_R.query(Pa_filtrada_np)  # Pa -> Pr
+
+        # Quantidade de pontos de A que têm um ponto em R_i dentro de D_max
+        total_pa = len(Pa_filtrada_np) # (True positives + False positives)
+        dists_validos_RA = dists_RA[dists_RA < max_dist]
+        total_correspondencias = len(dists_validos_RA)
+
+        # Precision = | { A_i | DNN(A_i, R_i) < D_max } | / | A |
+        if total_pa > 0:
+            precisao = (total_correspondencias / total_pa)
+        else:
+            precisao = 0
+
+        # Construir a árvore para P_a segmentadaa para o cálculo do recall
+        arv_A = KDTree(Pa_filtrada_np)
+        dists_AR, _ = arv_A.query(Pr_np)  # Pr -> Pa
+
+        # Quantidade de pontos de R_i que têm um ponto em A dentro de D_max
+        total_ref = len(Pr_np) # (True positives + False Negatives)
+        pontos_bem_representados = np.sum(dists_AR < max_dist)
+
+        # Recall = | { R_i | DNN(R_i, A) < D_max } | / | R_i |
+        if total_ref > 0:
+            recall = (pontos_bem_representados / total_ref) 
+        else:
+            recall = 0 
+
+        # F1-Score
+        if precisao + recall > 0:
+            f1_score = 2 * (precisao * recall) / (precisao + recall)
+        else:
+            f1_score = 0
+
+        false_positives = total_pa - total_correspondencias  # Pontos de Pa incorretamente associados
+        false_negatives = total_ref - pontos_bem_representados  # Pontos de Pr não representados
+        true_positives = pontos_bem_representados
+        true_negatives = total_ref - false_negatives  # Aproximação: o que resta de Pr corretamente associado
+
+        # Calcular o MCC
+        mcc = calcular_mcc(true_positives, true_negatives, false_positives, false_negatives)
+
+
+        # Estatísticas Pa para Pr
+        if len(dists_RA) > 0:
+            max_distancia = np.max(dists_RA)
+            min_distancia = np.min(dists_RA)
+            avg_distancia = np.mean(dists_RA)
+            sigma_distancia = np.std(dists_RA)
+        else:
+            max_distancia = min_distancia = avg_distancia = sigma_distancia = 0
+
+        resultados.append(
+            {
+                "Segmento": f"Parte {i + 1}",
+                "Distância Média": avg_distancia,
+                "Desvio Padrão (sigma)": sigma_distancia,
+                "Distância Máxima": max_distancia,
+                "Distância Mínima": min_distancia,
+                "Recall": recall,
+                "Precisão": precisao,
+                "F1-Score": f1_score,
+                "MCC": mcc,
+            }
+        )
+
+    df_resultados = pd.DataFrame(resultados)
+
+    return df_resultados
+
+
+
+def plotar_graficos(df_resultados):
+    template = "plotly_white"
+    color_discrete_sequence = px.colors.qualitative.Set2
+
+    fig1 = px.line(
+        df_resultados,
+        x="Segmento",
+        y="Distância Média",
+        color="Nome do Arquivo Pa",
+        title="Distância Média por Parte e Grupo",
+        template=template,
+        color_discrete_sequence=color_discrete_sequence,
+        markers=True,
     )
+    fig1.update_layout(
+        title_font_size=20, xaxis_title="Partes", yaxis_title="Distância Média"
+    )
+    fig1.show()
+
+    fig2 = px.line(
+        df_resultados,
+        x="Segmento",
+        y="Desvio Padrão (sigma)",
+        color="Nome do Arquivo Pa",
+        title="Desvio Padrão por Parte e Grupo",
+        template=template,
+        color_discrete_sequence=color_discrete_sequence,
+        markers=True,
+    )
+    fig2.update_layout(
+        title_font_size=20, xaxis_title="Partes", yaxis_title="Desvio Padrão (sigma)"
+    )
+    fig2.show()
+
+    df_resultados['Recall (%)'] = df_resultados['Recall'] * 100
+    fig3 = px.line(
+        df_resultados,
+        x="Segmento",
+        y="Recall (%)",
+        color="Nome do Arquivo Pa",
+        title="Recall por Segmentação",
+        template=template,
+        color_discrete_sequence=color_discrete_sequence,
+        markers=True,
+    )
+    fig3.update_layout(
+        title_font_size=20,
+        xaxis_title="Partes",
+        yaxis_title="Recall (%)",
+    )
+    fig3.show()
+
+    df_resultados['Precisão (%)'] = df_resultados['Precisão'] * 100
+    fig4 = px.line(
+        df_resultados,
+        x="Segmento",
+        y="Precisão",
+        color="Nome do Arquivo Pa",
+        title="Precisão por Segmentação",
+        template=template,
+        color_discrete_sequence=color_discrete_sequence,
+        markers=True,
+    )
+    fig4.update_layout(
+        title_font_size=20,
+        xaxis_title="Partes",
+        yaxis_title="Precisão",
+    )
+    fig4.show()
 
 
-# %% ANALISE GERAL DA NUVEM
-Pa = o3d.io.read_point_cloud("/mnt/d/data/maquetes/ptsam_voxelNERF.ply")
-Pr = o3d.io.read_point_cloud("/mnt/d/data/maquetes/reference_v1e2_subsample.ply")
+# Função para processar segmentação e avaliação
+def processar_segmentacao_e_avaliacao(pa_files, segmentadas_paths, max_dist):
+    Pr_segmentadas = [o3d.io.read_point_cloud(path) for path in segmentadas_paths]
+    resultados = []
 
-print("Nuvens de pontos carregadas.")
+    
+    for pa_file in pa_files:
+        Pa = o3d.io.read_point_cloud(pa_file)
 
+        # Segmentar Pa
+        df_pa_segmentada = segmentar_pa_por_distancia(Pa, Pr_segmentadas)
 
-(
-    idx_ruido,
-    idx_validos,
-    dists_validas,
-    idx_oclusos,
-    pct_representada,
-    max_distancia,
-    min_distancia,
-    avg_distancia,
-    sigma_distancia,
-    total_ref,
-) = marcar_ruido_e_proximidade(Pa, Pr)
+        # Correspondência para cada segmento de Pr
+        df_resultado = avaliar_correspondencia_segmentada(
+            df_pa_segmentada, Pr_segmentadas, max_dist
+        )
 
+    
+        df_resultado["Nome do Arquivo Pa"] = pa_file.split("/")[-1]
+        resultados.append(df_resultado)
 
-print(f"Distância média: {avg_distancia}")
-print(f"Desvio padrão (sigma): {sigma_distancia}")
-print(f"Número de índices de ruído: {len(idx_ruido)}")
-print(f"Número de índices válidos: {len(idx_validos)}")
-print(f"Número total de pontos na nuvem avalaida: {len(idx_validos)+len(idx_ruido)}")
-print(f"Número de índices de pontos oclusos: {len(idx_oclusos)}")
-print(f"Porcentagem da nuvem de referência bem representada: {pct_representada:.2f}%")
-print(f"Total de pontos na nuvem de referência: {total_ref}")
+    df_todos_resultados = pd.concat(resultados, ignore_index=True)
 
-# %% COMPARATIVO
-
-
-import pandas as pd
-
+    return df_todos_resultados
 
 pa_files = [
-    # "/mnt/d/data/maquetes/ptsam_PGM.ply",
-    #  "/mnt/d/data/maquetes/ptsam_NERF.ply",
-    # "/mnt/d/data/maquetes/ptsam_3GDS.ply",
-    #  "/mnt/d/data/maquetes/ptsam_voxelNERF.ply",
-    # "/mnt/d/data/maquetes/ptsam_voxelPedro.ply",
-    # "/mnt/d/data/maq_0407_sam/pro/point_cloud_gauss.ply",
-    "/mnt/d/data/artemis/0207_pro/ad_point_cloud.ply",
+    "/mnt/d/data/maquetes/ptsam_PGM.ply",
+    "/mnt/d/data/maquetes/ptsam_NERF.ply",
+    "/mnt/d/data/maquetes/ptsam_3GDS.ply",
+    "/mnt/d/data/maquetes/ptsam_voxelNERF.ply",
+    "/mnt/d/data/maquetes/ptsam_voxelPedro.ply",
+    "/mnt/d/data/maquetes/reference_v1e2_subsample.ply",
+    "/mnt/d/data/artemis/0207_pro/ptc_ali_0207_pro.ply",
 ]
-
 
 segmentadas_paths = [
     "/mnt/d/data/maquetes/maq_seg/Valvulas.ply",
@@ -120,152 +242,13 @@ segmentadas_paths = [
     "/mnt/d/data/maquetes/maq_seg/Motores_tanques.ply",
     "/mnt/d/data/maquetes/maq_seg/Superficie.ply",
 ]
-
-resultados = []
-
-for pa_file in pa_files:
-    Pa = o3d.io.read_point_cloud(pa_file)
-
-    for path in segmentadas_paths:
-        Pr_segmentada = o3d.io.read_point_cloud(path)
-
-        (
-            idx_ruido,
-            idx_validos,
-            dists_validas,
-            idx_oclusos,
-            pct_representada,
-            max_distancia,
-            min_distancia,
-            avg_distancia,
-            sigma_distancia,
-            total_ref,
-        ) = marcar_ruido_e_proximidade(Pa, Pr_segmentada)
-
-        resultado = {
-            "Nome do Arquivo Pa": pa_file.split("/")[-1],
-            "Nome do Arquivo Pr": path.split("/")[-1],
-            "Distância Média": avg_distancia,
-            "Desvio Padrão (sigma)": sigma_distancia,
-            "Porcentagem Representada": pct_representada,
-        }
-
-        resultados.append(resultado)
-
-df_resultados = pd.DataFrame(resultados)
-
-
 # %%
-
-import plotly.express as px
-
-
-df_resultados["Nome do Arquivo Pa"] = (
-    df_resultados["Nome do Arquivo Pa"]
-    .str.replace("ptsam_", "")
-    .str.replace(".ply", "")
-)
-df_resultados["Nome do Arquivo Pr"] = df_resultados["Nome do Arquivo Pr"].str.replace(
-    ".ply", ""
-)
-
-template = "plotly_white"
-color_discrete_sequence = px.colors.qualitative.Set2
-
-# Dist
-fig1 = px.line(
-    df_resultados,
-    x="Nome do Arquivo Pr",
-    y="Distância Média",
-    color="Nome do Arquivo Pa",
-    title="Distância Média por Parte e Grupo",
-    template=template,
-    color_discrete_sequence=color_discrete_sequence,
-    markers=True,
-)
-
-fig1.update_layout(
-    title_font_size=20, xaxis_title="Partes", yaxis_title="Distância Média"
-)
-
-# Sigma
-fig2 = px.line(
-    df_resultados,
-    x="Nome do Arquivo Pr",
-    y="Desvio Padrão (sigma)",
-    color="Nome do Arquivo Pa",
-    title="Desvio Padrão por Parte e Grupo",
-    template=template,
-    color_discrete_sequence=color_discrete_sequence,
-    markers=True,
-)
-
-fig2.update_layout(
-    title_font_size=20, xaxis_title="Partes", yaxis_title="Desvio Padrão (sigma)"
-)
-
-
-fig3 = px.line(
-    df_resultados,
-    x="Nome do Arquivo Pr",
-    y="Porcentagem Representada",
-    color="Nome do Arquivo Pa",
-    title="Porcentagem Representada por Segmentação",
-    template=template,
-    color_discrete_sequence=color_discrete_sequence,
-    markers=True,
-)
-
-fig3.update_layout(
-    title_font_size=20, xaxis_title="Partes", yaxis_title="Porcentagem Representada (%)"
-)
-
-
-fig1.show()
-fig2.show()
-fig3.show()
-
-
+# Carregar as nuvens e gerar métricas
+max_dist = 0.1
+df_resultados = processar_segmentacao_e_avaliacao(pa_files, segmentadas_paths, max_dist)
 # %%
-# Box plot com média e desvio padrão
-import matplotlib.pyplot as plt
-
-# Preparar os dados
-df_resultados["Nome do Arquivo Pa"] = (
-    df_resultados["Nome do Arquivo Pa"]
-    .str.replace("ptsam_", "")
-    .str.replace(".ply", "")
-)
-
-# Calculando as métricas
-mean_values = df_resultados.groupby("Nome do Arquivo Pa")[
-    "Porcentagem Representada"
-].mean()
-std_values = df_resultados.groupby("Nome do Arquivo Pa")[
-    "Porcentagem Representada"
-].std()
-
-# Plotando o box plot com média e desvio padrão
-fig, ax = plt.subplots(figsize=(12, 8))
-
-# Box plot
-df_resultados.boxplot(
-    column="Porcentagem Representada", by="Nome do Arquivo Pa", ax=ax, grid=False
-)
-
-# Adicionando médias e desvios padrões
-for i, nome_pa in enumerate(mean_values.index):
-    mean = mean_values[nome_pa]
-    std = std_values[nome_pa]
-    ax.plot(i + 1, mean, "ro")
-    ax.errorbar(i + 1, mean, yerr=std, fmt="o", color="red", capsize=5)
-
-# Customizando o gráfico
-plt.title("Box Plot com Média e Desvio Padrão das Porcentagens Representadas")
-plt.suptitle("")
-plt.xlabel("Nome do Arquivo Pa")
-plt.ylabel("Porcentagem Representada")
-plt.grid(True)
-
-# Exibindo o gráfico
-plt.show()
+# Plotar gráficos dos resultados
+plotar_graficos(df_resultados)
+# %%
+print(df_resultados[['Segmento', 'Recall', 'Precisão', 'F1-Score', 'MCC']])
+# %%
